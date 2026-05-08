@@ -1,36 +1,17 @@
 # python-socketio AsyncRedisManager reconnect leak repro
 
-Minimal reproduction for a resource leak in `socketio.AsyncRedisManager`'s
-reconnect path.
+Minimal reproduction for https://github.com/miguelgrinberg/python-socketio/issues/1569.
 
-## What leaks
+## The bug
 
-`AsyncRedisManager._redis_connect` reassigns `self.redis` and `self.pubsub`
-to fresh instances without closing the previous ones:
+`AsyncRedisManager._redis_connect` overwrites `self.redis` and `self.pubsub` without closing the previous ones. The old `Redis` client is never `await`ed closed, so its TCP socket (and TLS session for `rediss://`) is leaked.
 
-```python
-def _redis_connect(self):
-    ...
-    self.redis = module.Redis.from_url(self.redis_url, **self.redis_options)
-    self.pubsub = self.redis.pubsub(ignore_subscribe_messages=True)
-    self.connected = True
-```
+`redis.asyncio.Redis` requires `await aclose()` for cleanup; its `__del__` only emits `ResourceWarning: Unclosed client session` because async cleanup cannot run in `__del__`. The manager owns the client, so the manager must close it.
 
-The method is invoked by both reconnect paths:
+`_redis_connect` runs on every reconnect:
 
-- `_publish` calls it after the first failed publish
+- `_publish` calls it after a failed publish
 - `_redis_listen_with_retries` calls it after any `RedisError`
-
-`redis.asyncio.connection.Connection` only has a synchronous `__del__` that
-emits a `ResourceWarning`. It cannot `await` the protocol's drain/close, so
-the underlying TCP socket and (for `rediss://`) the TLS session are never
-released cleanly. They linger until the OS reaps them via TCP keepalive.
-
-In production this surfaces whenever anything else still references the
-orphaned client (a traceback held by a log handler, Sentry breadcrumb,
-background task closure, etc.). The Python objects stay live, the sockets
-stay `ESTABLISHED` on the Redis server, and the `CLIENT LIST` slot count
-grows with each reconnect.
 
 ## Run
 
@@ -54,35 +35,19 @@ release refs and gc.collect():
               heap={'Redis': 1, 'ConnectionPool': 1, 'Connection': 1}  sockets=1
 ```
 
-A `ResourceWarning: unclosed Connection <redis.asyncio.connection.Connection(...)>`
-is emitted for each orphaned client when it is finally GC'd.
+Each iteration emits `ResourceWarning: unclosed Connection`.
 
-## Versions
-
-Reproduces on:
-- python-socketio 5.16.1 (current main)
-- python-socketio 5.8.0
-
-5.15.0 (#1534) made the initial connect resilient but did not change the
-reconnect path.
+Also reproduces on python-socketio 5.8.0.
 
 ## Suggested fix
 
-`_redis_connect` is sync today but its two callers (`_publish`,
-`_redis_listen_with_retries`) are already async. Making the cleanup awaitable
-is mechanically straightforward:
+`_redis_connect` is sync today but both callers are already async, so cleanup can be awaited:
 
 ```python
 async def _redis_connect(self):
     if self.pubsub is not None:
-        try:
-            await self.pubsub.aclose()
-        except Exception:
-            pass
+        await self.pubsub.aclose()
     if self.redis is not None:
-        try:
-            await self.redis.aclose()
-        except Exception:
-            pass
+        await self.redis.aclose()
     # ... existing code that builds new self.redis and self.pubsub
 ```
