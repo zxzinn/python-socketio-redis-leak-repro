@@ -27,7 +27,7 @@ redis-cli -p 6379 CLIENT KILL TYPE normal >/dev/null 2>&1 || true
 cleanup() {
     [ -n "${PROXY_PID:-}" ] && kill -9 "$PROXY_PID" 2>/dev/null
     [ -n "${GUN_PID:-}" ] && kill -9 "$GUN_PID" 2>/dev/null
-    pkill -9 -f "standalone_repro/proxy.py" 2>/dev/null
+    pkill -9 -f "$(pwd)/proxy.py" 2>/dev/null
     pkill -9 -f "gunicorn app:app" 2>/dev/null
 }
 trap cleanup EXIT

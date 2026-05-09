@@ -5,7 +5,6 @@ For https://github.com/miguelgrinberg/python-socketio/issues/1569
 ## Run
 
 ```
-cd standalone_repro
 ./run.sh
 ```
 
