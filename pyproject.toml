@@ -3,7 +3,10 @@ name = "python-socketio-redis-leak-repro"
 version = "0.0.0"
 requires-python = ">=3.10"
 dependencies = [
-    "python-socketio==5.16.1",
+    "python-socketio==5.8.0",
     "redis>=5,<6",
-    "psutil>=5.9",
+    "uvicorn",
+    "gunicorn",
+    "aiohttp",
+    "websocket-client",
 ]
