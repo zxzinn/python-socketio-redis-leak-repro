@@ -1,53 +1,66 @@
-# python-socketio AsyncRedisManager reconnect leak repro
+# python-socketio AsyncRedisManager listen-path leak repro
 
-Minimal reproduction for https://github.com/miguelgrinberg/python-socketio/issues/1569.
+Repro for https://github.com/miguelgrinberg/python-socketio/issues/1569
 
-## The bug
+## What it shows
 
-`AsyncRedisManager._redis_connect` overwrites `self.redis` and `self.pubsub` without closing the previous ones. The old `Redis` client is never `await`ed closed, so its TCP socket (and TLS session for `rediss://`) is leaked.
+`AsyncRedisManager._redis_listen_with_retries` catches `RedisError`, swaps
+`self.redis` and `self.pubsub` via `_redis_connect()`, and resubscribes.
+The previous `Redis` and `PubSub` instances are discarded without
+`await aclose()`. Their TCP sockets stay `ESTABLISHED` on the Redis server.
 
-`redis.asyncio.Redis` requires `await aclose()` for cleanup; its `__del__` only emits `ResourceWarning: Unclosed client session` because async cleanup cannot run in `__del__`. The manager owns the client, so the manager must close it.
-
-`_redis_connect` runs on every reconnect:
-
-- `_publish` calls it after a failed publish
-- `_redis_listen_with_retries` calls it after any `RedisError`
+After N reconnects we observe N orphaned `cmd=subscribe` rows in
+`CLIENT LIST`, all with `idle == age` (never used after creation).
 
 ## Run
 
-Requires a local Redis on `localhost:6379`.
-
 ```
-uv run python repro.py
-```
-
-## Output (python-socketio 5.16.1, redis 5.x, Python 3.13)
-
-```
-warmup        heap={'Redis': 1, 'ConnectionPool': 1, 'Connection': 1}  sockets=1
-reconnect #1  heap={'Redis': 2, 'ConnectionPool': 2, 'Connection': 2}  sockets=2  refs_held=1
-reconnect #2  heap={'Redis': 3, 'ConnectionPool': 3, 'Connection': 3}  sockets=3  refs_held=2
-reconnect #3  heap={'Redis': 4, 'ConnectionPool': 4, 'Connection': 4}  sockets=4  refs_held=3
-reconnect #4  heap={'Redis': 5, 'ConnectionPool': 5, 'Connection': 5}  sockets=5  refs_held=4
-reconnect #5  heap={'Redis': 6, 'ConnectionPool': 6, 'Connection': 6}  sockets=6  refs_held=5
-
-release refs and gc.collect():
-              heap={'Redis': 1, 'ConnectionPool': 1, 'Connection': 1}  sockets=1
+cd standalone_repro
+./run.sh
 ```
 
-Each iteration emits `ResourceWarning: unclosed Connection`.
+Requires:
+- a real Redis on `127.0.0.1:6379`
+- `uv`
+- `gunicorn`/`uvicorn`/`python-socketio==5.8.0`/`redis>=5,<6` (uv installs them)
 
-Also reproduces on python-socketio 5.8.0.
+## What the script does
 
-## Suggested fix
+1. Starts a TCP proxy on `127.0.0.1:6391` that forwards to `127.0.0.1:6379`.
+2. Starts gunicorn with 2 `uvicorn.workers.UvicornH11Worker` workers running
+   `app.py`, which is a minimal ASGI app wiring a single `AsyncRedisManager`
+   pointed at the proxy. The lifespan handler triggers `manager.initialize()`
+   so the listen task is spawned at startup.
+3. Sends `SIGUSR1` to the proxy 10 times, with 3-second gaps. Each `SIGUSR1`
+   makes the proxy write invalid RESP bytes to all client writers without
+   closing the socket. The manager's `pubsub.listen()` raises `RedisError`,
+   `_redis_listen_with_retries` enters its except branch, sleeps with
+   exponential backoff, then reconnects via `_redis_connect()`.
+4. After each round, prints the count of `cmd=subscribe` rows on the real
+   Redis server.
 
-`_redis_connect` is sync today but both callers are already async, so cleanup can be awaited:
+## Observed output
 
-```python
-async def _redis_connect(self):
-    if self.pubsub is not None:
-        await self.pubsub.aclose()
-    if self.redis is not None:
-        await self.redis.aclose()
-    # ... existing code that builds new self.redis and self.pubsub
 ```
+gunicorn ready
+initial server-side subscribe count: 2
+after garbage #1: subscribe=4
+after garbage #2: subscribe=6
+after garbage #3: subscribe=8
+after garbage #4: subscribe=10
+after garbage #5: subscribe=12
+after garbage #6: subscribe=14
+after garbage #7: subscribe=16
+after garbage #8: subscribe=18
+after garbage #9: subscribe=20
+after garbage #10: subscribe=22
+```
+
+2 workers, +2 per round. 22 subscribe rows after 10 rounds, all with
+`idle == age` and no client-side fd in `lsof` for any but the 2 active.
+
+## Versions
+
+- python-socketio 5.8.0 (also reproduces on 5.16.1)
+- redis 5.x
+- Python 3.13
